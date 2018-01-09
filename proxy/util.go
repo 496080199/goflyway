@@ -1,79 +1,265 @@
 package proxy
 
 import (
-	"../logg"
-	"../lookup"
+	"bytes"
+	"fmt"
+
+	"github.com/coyove/goflyway/pkg/logg"
 
 	"crypto/tls"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
 	"io"
-	"io/ioutil"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	socks5Version = byte(0x05)
-	socksTypeIPv4 = 1
-	socksTypeDm   = 3
-	socksTypeIPv6 = 4
+	socksVersion5   = byte(0x05)
+	socksAddrIPv4   = 1
+	socksAddrDomain = 3
+	socksAddrIPv6   = 4
+	socksReadErr    = "cannot read buffer: "
+	socksVersionErr = "invalid SOCKS version (SOCKS5 only)"
+)
 
-	DO_NOTHING    = 0
-	DO_THROTTLING = 1
-	DO_SOCKS5     = 1 << 16
+const (
+	doConnect = 1 << iota
+	doForward
+	doWebSocket
+	doDNS
+	doRSV1
+	doRSV2
+	doRSV3
+	doRSV4
+)
 
-	HOST_HTTP_CONNECT  = '*'
-	HOST_HTTP_FORWARD  = '#'
-	HOST_SOCKS_CONNECT = '$'
-	HOST_DOMAIN_LOOKUP = '!'
+const (
+	PolicyDisabled = 1 << iota
+	PolicyManInTheMiddle
+	PolicyGlobal
+	PolicyTrustClientDNS
+	PolicyAggrClosing
+	PolicyWebSocket
+)
 
-	RKEY_HEADER     = "X-Request-ID"
-	DNS_HEADER      = "X-Host-Lookup"
-	AUTH_HEADER     = "X-Authorization"
-	CANNOT_READ_BUF = "[SOCKS] cannot read buffer - "
-	NOT_SOCKS5      = "[SOCKS] invalid socks version (socks5 only)"
+const (
+	timeoutUDP          = time.Duration(30) * time.Second
+	timeoutTCP          = time.Duration(60) * time.Second
+	timeoutDial         = time.Duration(5) * time.Second
+	timeoutOp           = time.Duration(20) * time.Second
+	invalidRequestRetry = 10
+	dnsRespHeader       = "ETag"
+	errConnClosedMsg    = "use of closed network connection"
 )
 
 var (
-	OK_HTTP = []byte("HTTP/1.0 200 OK\r\n\r\n")
-	// version, granted = 0, 0, ipv4, 0, 0, 0, 0, (port) 0, 0
-	OK_SOCKS = []byte{socks5Version, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01}
-
-	tlsSkip = &tls.Config{InsecureSkipVerify: true}
-
-	hostHeadExtract = regexp.MustCompile(`(\S+)\.com`)
-	urlExtract      = regexp.MustCompile(`\?q=(\S+)$`)
+	okHTTP          = []byte{'H', 'T', 'T', 'P', '/', '1', '.', '1', ' ', '2', '0', '0', ' ', 'O', 'K', '\r', '\n', '\r', '\n'}
+	okSOCKS         = []byte{socksVersion5, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	udpHeaderIPv4   = []byte{0, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	udpHeaderIPv6   = []byte{0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	socksHandshake  = []byte{socksVersion5, 1, 0}
+	dummyHeaders    = []string{"Accept-Language", "User-Agent", "Referer", "Cache-Control", "Accept-Encoding", "Connection", "ph"}
+	tlsSkip         = &tls.Config{InsecureSkipVerify: true}
 	hasPort         = regexp.MustCompile(`:\d+$`)
-
-	base32Encoding = base32.NewEncoding("0123456789abcdfgijklmnopqsuvwxyz")
-	base32Replace  = []string{"th", "er", "t", "h", "e", "r"}
+	isHTTPSSchema   = regexp.MustCompile(`^https:\/\/`)
+	base32Encoding  = base32.NewEncoding("0123456789abcdefghiklmnoprstuwxy")
+	base32Encoding2 = base32.NewEncoding("abcd&fghijklmnopqrstuvwxyz+-_./e")
 )
 
-func SafeAddHeader(req *http.Request, k, v string) {
-	if orig := req.Header.Get(k); orig != "" {
-		req.Header.Set(k, v+" "+orig)
+type Options byte
+
+func (o *Options) IsSet(option byte) bool { return (byte(*o) & option) != 0 }
+
+func (o *Options) Set(option byte) { *o = Options(byte(*o) | option) }
+
+func (o *Options) UnSet(option byte) { *o = Options((byte(*o) | option) - option) }
+
+func (o *Options) Val() byte { return byte(*o) }
+
+func (proxy *ProxyClient) addToDummies(req *http.Request) {
+	for _, field := range dummyHeaders {
+		if field == "" {
+			proxy.dummies.Add("ph", "") // add a placeholder
+		} else if x := req.Header.Get(field); x != "" {
+			proxy.dummies.Add(field, x)
+		}
+	}
+}
+
+func (proxy *ProxyClient) genHost() string {
+	const tlds = ".com.net.org"
+	if proxy.DummyDomain == "" {
+		i := proxy.Rand.Intn(3) * 4
+		return proxy.Cipher.genWord(true) + tlds[i:i+4]
+	}
+
+	return proxy.DummyDomain
+}
+
+func (proxy *ProxyClient) encryptAndTransport(req *http.Request) (*http.Response, []byte, error) {
+	rkey, rkeybuf := proxy.Cipher.NewIV(doForward, nil, proxy.UserAuth)
+	req.Header.Add(proxy.rkeyHeader, rkey)
+
+	proxy.addToDummies(req)
+
+	if proxy.URLHeader != "" {
+		req.Header.Add(proxy.URLHeader, "http://"+proxy.genHost()+"/"+proxy.Cipher.EncryptCompress(req.URL.String(), rkeybuf...))
+		req.Host = proxy.Upstream
+		req.URL, _ = url.Parse("http://" + proxy.Upstream)
 	} else {
-		req.Header.Add(k, v)
+		req.Host = proxy.genHost()
+		req.URL, _ = url.Parse("http://" + req.Host + "/" + proxy.Cipher.EncryptCompress(req.URL.String(), rkeybuf...))
+	}
+
+	if proxy.Policy.IsSet(PolicyManInTheMiddle) && proxy.Connect2Auth != "" {
+		x := "Basic " + base64.StdEncoding.EncodeToString([]byte(proxy.Connect2Auth))
+		req.Header.Add("Proxy-Authorization", x)
+		req.Header.Add("Authorization", x)
+	}
+
+	cookies := make([]string, 0, len(req.Cookies()))
+	for _, c := range req.Cookies() {
+		c.Value = proxy.Cipher.EncryptString(c.Value, rkeybuf...)
+		cookies = append(cookies, c.String())
+	}
+
+	req.Header.Set("Cookie", strings.Join(cookies, ";"))
+	if origin := req.Header.Get("Origin"); origin != "" {
+		req.Header.Set("Origin", proxy.EncryptString(origin, rkeybuf...)+".com")
+	}
+
+	if referer := req.Header.Get("Referer"); referer != "" {
+		req.Header.Set("Referer", proxy.EncryptString(referer, rkeybuf...))
+	}
+
+	req.Body = proxy.Cipher.IO.NewReadCloser(req.Body, rkeybuf)
+	// logg.D(req.Header)
+	resp, err := proxy.tp.RoundTrip(req)
+	return resp, rkeybuf, err
+}
+
+func stripURI(uri string) string {
+	if len(uri) < 1 {
+		return uri
+	}
+
+	if uri[0] != '/' {
+		idx := strings.Index(uri[8:], "/")
+		if idx > -1 {
+			uri = uri[idx+1+8:]
+		} else {
+			logg.W("unexpected URI: ", uri)
+		}
+	} else {
+		uri = uri[1:]
+	}
+
+	return uri
+}
+
+func (proxy *ProxyUpstream) decryptRequest(req *http.Request, rkeybuf []byte) bool {
+	var err error
+	req.URL, err = url.Parse(proxy.Cipher.DecryptDecompress(stripURI(req.RequestURI), rkeybuf...))
+	if err != nil {
+		logg.E(err)
+		return false
+	}
+
+	req.Host = req.URL.Host
+
+	cookies := make([]string, 0, len(req.Cookies()))
+	for _, c := range req.Cookies() {
+		c.Value = proxy.Cipher.DecryptString(c.Value, rkeybuf...)
+		cookies = append(cookies, c.String())
+	}
+	req.Header.Set("Cookie", strings.Join(cookies, ";"))
+
+	if origin := req.Header.Get("Origin"); len(origin) > 4 {
+		req.Header.Set("Origin", proxy.DecryptString(origin[:len(origin)-4], rkeybuf...))
+	}
+
+	if referer := req.Header.Get("Referer"); referer != "" {
+		req.Header.Set("Referer", proxy.DecryptString(referer, rkeybuf...))
+	}
+
+	for k := range req.Header {
+		if k[:3] == "Cf-" || (len(k) > 12 && strings.ToLower(k[:12]) == "x-forwarded-") {
+			// ignore all cloudflare headers
+			// this is needed when you use cf as the frontend:
+			// gofw client -> cloudflare -> gofw server -> target host using cloudflare
+
+			// delete all x-forwarded-... headers
+			// some websites won't allow them
+			req.Header.Del(k)
+		}
+	}
+
+	req.Body = proxy.Cipher.IO.NewReadCloser(req.Body, rkeybuf)
+	return true
+}
+
+func copyHeaders(dst, src http.Header, gc *Cipher, enc bool, rkeybuf []byte) {
+	for k := range dst {
+		dst.Del(k)
+	}
+
+	setcookies := []string{}
+	for k, vs := range src {
+	READ:
+		for _, v := range vs {
+			switch strings.ToLower(k) {
+			case "set-cookie":
+				if rkeybuf != nil {
+					if enc {
+						setcookies = append(setcookies, v)
+						continue READ
+					} else {
+						ei, di := strings.Index(v, "="), strings.Index(v, ";")
+						if di == -1 {
+							di = len(v)
+						}
+
+						v = gc.DecryptDecompress(v[ei+1:di], rkeybuf...)
+					}
+				}
+			case "content-encoding", "content-type":
+				if enc {
+					dst.Add("X-"+k, v)
+					continue READ
+				} else if rkeybuf != nil {
+					continue READ
+				}
+
+				// rkeybuf is nil and we are in decrypt mode
+				// aka plain copy mode, so fall to the bottom
+			case "x-content-encoding", "x-content-type":
+				if !enc {
+					dst.Add(k[2:], v)
+					continue READ
+				}
+			}
+
+			for _, vn := range strings.Split(v, "\n") {
+				dst.Add(k, vn)
+			}
+		}
+	}
+
+	if len(setcookies) > 0 && rkeybuf != nil {
+		// some http proxies or middlewares will combine multiple Set-Cookie headers into one
+		// but some browsers do not support this behavior
+		// here we just do the combination in advance and split them when decrypting
+		dst.Add("Set-Cookie", gc.genWord(true)+"="+
+			gc.EncryptCompress(strings.Join(setcookies, "\n"), rkeybuf...)+"; Domain="+gc.genWord(true)+".com; HttpOnly")
 	}
 }
 
-func SafeGetHeader(req *http.Request, k string) string {
-	v := req.Header.Get(k)
-	if s := strings.Index(v, " "); s > 0 {
-		req.Header.Set(k, v[s+1:])
-		v = v[:s]
-	}
-
-	return v
-}
-
-func (proxy *ProxyHttpServer) basicAuth(token string) string {
+func (proxy *ProxyClient) basicAuth(token string) string {
 	parts := strings.Split(token, " ")
 	if len(parts) != 2 {
 		return ""
@@ -86,291 +272,120 @@ func (proxy *ProxyHttpServer) basicAuth(token string) string {
 
 	if s := string(pa); s == proxy.UserAuth {
 		return s
-	} else {
-		return ""
-	}
-}
-
-func (proxy *ProxyHttpServer) EncryptRequest(req *http.Request) string {
-	req.Host = EncryptHost(proxy.GCipher, req.Host, HOST_HTTP_FORWARD)
-	req.URL, _ = url.Parse("http://" + req.Host + "/?q=" + proxy.GCipher.EncryptString(req.URL.String()))
-
-	rkey := proxy.GCipher.RandomKey()
-	SafeAddHeader(req, RKEY_HEADER, rkey)
-
-	add := func(field string) {
-		if x := req.Header.Get(field); x != "" {
-			proxy.Dummies.Add(field, x)
-		}
 	}
 
-	add("Accept-Language")
-	add("User-Agent")
-	add("Referer")
-	add("Cache-Control")
-	add("Accept-Encoding")
-	add("Connection")
-
-	for _, c := range req.Cookies() {
-		c.Value = proxy.GCipher.EncryptString(c.Value)
-	}
-
-	req.Body = ioutil.NopCloser((&IOReaderCipher{
-		Src:    req.Body,
-		Key:    proxy.GCipher.ReverseRandomKey(rkey),
-		Cipher: proxy.GCipher,
-	}).Init())
-
-	return rkey
-}
-
-func (proxy *ProxyUpstreamHttpServer) DecryptRequest(req *http.Request) string {
-	req.Host = DecryptHost(proxy.GCipher, req.Host, HOST_HTTP_FORWARD)
-	if p := urlExtract.FindStringSubmatch(req.URL.String()); len(p) > 1 {
-		req.URL, _ = url.Parse(proxy.GCipher.DecryptString(p[1]))
-	}
-
-	rkey := SafeGetHeader(req, RKEY_HEADER)
-
-	for _, c := range req.Cookies() {
-		c.Value = proxy.GCipher.DecryptString(c.Value)
-	}
-
-	req.Body = ioutil.NopCloser((&IOReaderCipher{
-		Src:    req.Body,
-		Key:    proxy.GCipher.ReverseRandomKey(rkey),
-		Cipher: proxy.GCipher,
-	}).Init())
-	return rkey
-}
-
-func copyHeaders(dst, src http.Header) {
-	for k := range dst {
-		dst.Del(k)
-	}
-	for k, vs := range src {
-		for _, v := range vs {
-			dst.Add(k, v)
-		}
-	}
-}
-
-func getAuth(r *http.Request) string {
-	pa := r.Header.Get("Proxy-Authorization")
-	if pa == "" {
-		pa = r.Header.Get(AUTH_HEADER)
-	}
-
-	return pa
+	return ""
 }
 
 func tryClose(b io.ReadCloser) {
 	if err := b.Close(); err != nil {
-		logg.W("can't close response body - ", err)
+		logg.W("cannot close: ", err)
 	}
 }
 
-func SplitHostPort(host string) (string, string) {
-	if idx := strings.Index(host, ":"); idx > 0 {
-		return strings.ToLower(host[:idx]), host[idx:] // Port has a colon ':'
+func splitHostPort(host string) (string, string) {
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		idx2 := strings.LastIndex(host, "]")
+		if idx2 < idx {
+			return strings.ToLower(host[:idx]), host[idx:]
+		}
+
+		// ipv6 without port
+	}
+
+	return strings.ToLower(host), ""
+}
+
+func isTrustedToken(mark string, rkeybuf []byte) int {
+	logg.D("test token: ", rkeybuf)
+
+	if string(rkeybuf[:len(mark)]) != mark {
+		return 0
+	}
+
+	sent := int64(binary.BigEndian.Uint32(rkeybuf[12:]))
+	if time.Now().Unix()-sent >= 10 {
+		// token becomes invalid after 10 seconds
+		return -1
+	}
+
+	return 1
+}
+
+func genTrustedToken(mark, auth string, gc *Cipher) string {
+	buf := make([]byte, ivLen)
+
+	copy(buf, []byte(mark))
+	binary.BigEndian.PutUint32(buf[ivLen-4:], uint32(time.Now().Unix()))
+
+	k, _ := gc.NewIV(0, buf, auth)
+	return k
+}
+
+func base32Encode(buf []byte, alpha bool) string {
+	var str string
+	if alpha {
+		str = base32Encoding.EncodeToString(buf)
 	} else {
-		return strings.ToLower(host), ""
+		str = base32Encoding2.EncodeToString(buf)
 	}
-}
-
-func EncryptHost(c *GCipher, text string, mark byte) string {
-	host, port := SplitHostPort(text)
-
-	enc := func(in string) string {
-		if !c.Shoco {
-			return Base32Encode(c.Encrypt([]byte(in)))
-		} else {
-			return Base32Encode(c.Encrypt(shocoCompress(in)))
-		}
-	}
-
-	if lookup.IPAddressToInteger(host) != 0 {
-		return enc(string(mark)+host) + port
-	}
-
-	parts := strings.Split(host, ".")
-	flag := false
-	for i := len(parts) - 1; i >= 0; i-- {
-		if !tlds[parts[i]] {
-			parts[i] = enc(string(mark) + parts[i])
-			flag = true
-			break
-		}
-	}
-
-	if flag {
-		return strings.Join(parts, ".") + port
-	}
-
-	return enc(string(mark)+host) + port
-}
-
-func DecryptHost(c *GCipher, text string, mark byte) string {
-	host, m := TryDecryptHost(c, text)
-	if m != mark {
-		return ""
-	} else {
-		return host
-	}
-}
-
-func TryDecryptHost(c *GCipher, text string) (h string, m byte) {
-	host, port := SplitHostPort(text)
-	parts := strings.Split(host, ".")
-
-	for i := len(parts) - 1; i >= 0; i-- {
-		if !tlds[parts[i]] {
-			buf := Base32Decode(parts[i])
-
-			if !c.Shoco {
-				parts[i] = string(c.Decrypt(buf))
-			} else {
-				parts[i] = shocoDecompress(c.Decrypt(buf))
-			}
-
-			if len(parts[i]) == 0 {
-				return text, 0
-			} else {
-				m = parts[i][0]
-			}
-			parts[i] = parts[i][1:]
-			break
-		}
-	}
-
-	return strings.Join(parts, ".") + port, m
-}
-
-func Base32Encode(buf []byte) string {
-	str := base32Encoding.EncodeToString(buf)
 	idx := strings.Index(str, "=")
 
 	if idx == -1 {
 		return str
 	}
 
-	return str[:idx] + base32Replace[len(str)-idx-1]
+	return str[:idx]
 }
 
-func Base32Decode(text string) []byte {
+func base32Decode(text string, alpha bool) ([]byte, error) {
 	const paddings = "======"
 
-	for i := 0; i < len(base32Replace); i++ {
-		if strings.HasSuffix(text, base32Replace[i]) {
-			text = text[:len(text)-len(base32Replace[i])] + paddings[:i+1]
+	if m := len(text) % 8; m > 1 {
+		text = text + paddings[:8-m]
+	}
+
+	if alpha {
+		return base32Encoding.DecodeString(text)
+	}
+
+	return base32Encoding2.DecodeString(text)
+}
+
+func readUntil(r io.Reader, eoh string) ([]byte, error) {
+	buf, respbuf := make([]byte, 1), &bytes.Buffer{}
+	eidx, found := 0, false
+
+	for {
+		n, err := r.Read(buf)
+		if n == 1 {
+			respbuf.WriteByte(buf[0])
+		}
+
+		if buf[0] == eoh[eidx] {
+			if eidx++; eidx == len(eoh) {
+				found = true
+				break
+			}
+		} else {
+			eidx = 0
+		}
+
+		if err != nil {
+			if err != io.EOF {
+				return nil, err
+			}
 			break
 		}
 	}
 
-	buf, err := base32Encoding.DecodeString(text)
-	if err != nil {
-		return []byte{}
+	if !found {
+		return nil, fmt.Errorf("readUntil cannot find the pattern: %v", []byte(eoh))
 	}
 
-	return buf
+	return respbuf.Bytes(), nil
 }
 
-type addr_t struct {
-	ip   net.IP
-	host string
-	port int
-}
-
-func (a *addr_t) String() string {
-	if a.ip != nil {
-		return a.ip.String() + ":" + strconv.Itoa(a.port)
-	} else {
-		return a.host + ":" + strconv.Itoa(a.port)
-	}
-}
-
-func (a *addr_t) IP() net.IP {
-	if a.ip != nil {
-		return a.ip
-	}
-
-	ip, err := net.ResolveIPAddr("ip", a.host)
-	if err != nil {
-		logg.E("[ADT] ", err)
-		return nil
-	}
-
-	return ip.IP
-}
-
-func (a *addr_t) IsAllZeros() bool {
-	if a.ip != nil {
-		return a.ip.IsUnspecified() && a.port == 0
-	}
-
-	return false
-}
-
-func ParseDstFrom(conn net.Conn, typeBuf []byte, omitCheck bool) (byte, *addr_t, bool) {
-	var err error
-	var n int
-
-	if typeBuf == nil {
-		typeBuf, n = make([]byte, 256+3+1+1+2), 0
-		// conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		if n, err = io.ReadAtLeast(conn, typeBuf, 3+1+net.IPv4len+2); err != nil {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
-		}
-	}
-
-	if typeBuf[0] != socks5Version && !omitCheck {
-		logg.E(NOT_SOCKS5)
-		return 0x0, nil, false
-	}
-
-	if typeBuf[1] != 0x01 && typeBuf[1] != 0x03 && !omitCheck { // 0x01: establish a TCP/IP stream connection
-		logg.E("[SOCKS] invalid command: ", typeBuf[1])
-		return 0x0, nil, false
-	}
-
-	reqLen := -1
-	switch typeBuf[3] {
-	case socksTypeIPv4:
-		reqLen = 3 + 1 + net.IPv4len + 2
-	case socksTypeIPv6:
-		reqLen = 3 + 1 + net.IPv6len + 2
-	case socksTypeDm:
-		reqLen = 3 + 1 + 1 + int(typeBuf[4]) + 2
-	default:
-		logg.E("[SOCKS] invalid type")
-		return 0x0, nil, false
-	}
-
-	if conn != nil {
-		if _, err = io.ReadFull(conn, typeBuf[n:reqLen]); err != nil {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
-		}
-	} else {
-		if len(typeBuf) < reqLen {
-			logg.E(CANNOT_READ_BUF, err)
-			return 0x0, nil, false
-		}
-	}
-
-	rawaddr := typeBuf[3 : reqLen-2]
-	addr := &addr_t{}
-	addr.port = int(binary.BigEndian.Uint16(typeBuf[reqLen-2:]))
-
-	switch typeBuf[3] {
-	case socksTypeIPv4:
-		addr.ip = net.IP(rawaddr[1:])
-	case socksTypeIPv6:
-		addr.ip = net.IP(rawaddr[1:])
-	default:
-		addr.host = string(rawaddr[2:])
-	}
-
-	return typeBuf[1], addr, true
+func isClosedConnErr(err error) bool {
+	return strings.Contains(err.Error(), errConnClosedMsg)
 }
