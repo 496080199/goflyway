@@ -231,7 +231,7 @@ func main() {
 	if *cmdDebug {
 		fmt.Println("* debug mode on")
 
-		cc.Upstream = "127.0.0.1:8101"
+		cc.Upstream = "0.0.0.0:8101"
 		client := proxy.NewClient(":8100", cc)
 		go func() {
 			logg.F(client.Start())
@@ -259,7 +259,7 @@ func main() {
 
 		if *cmdWebConPort != 0 {
 			go func() {
-				addr := fmt.Sprintf("127.0.0.1:%d", *cmdWebConPort)
+				addr := fmt.Sprintf("0.0.0.0:%d", *cmdWebConPort)
 				http.HandleFunc("/", lib.WebConsoleHTTPHandler(client))
 				fmt.Println("* access client web console at [", addr, "]")
 				logg.F(http.ListenAndServe(addr, nil))

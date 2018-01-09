@@ -621,11 +621,11 @@ func NewClient(localaddr string, config *ClientConfig) *ProxyClient {
 
 	if port, lerr := strconv.Atoi(localaddr); lerr == nil {
 		mux, err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv6zero, Port: port})
-		localaddr = "127.0.0.1:" + localaddr
+		localaddr = "0.0.0.0:" + localaddr
 	} else {
 		mux, err = net.Listen("tcp", localaddr)
 		if localaddr[0] == ':' {
-			localaddr = "127.0.0.1" + localaddr
+			localaddr = "0.0.0.0" + localaddr
 		}
 	}
 
